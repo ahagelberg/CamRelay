@@ -1,0 +1,51 @@
+# Build artifacts
+build/
+*.o
+*.a
+*.so
+*.exe
+*.dll
+*.dylib
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+*.tmp
+*.temp
+
+# Log files
+*.log
+logs/
+
+# Configuration files (keep examples)
+config/*.conf
+!config/*.example
+!config/*.json.example
+
+# PID files
+*.pid
+
+# Test artifacts
+test_results/
+coverage/
+
+# Package files
+*.deb
+*.rpm
+*.tar.gz
+*.zip
+
+# Dependencies
+third_party/
+deps/
+
+# Generated files
+config.h
+version.h

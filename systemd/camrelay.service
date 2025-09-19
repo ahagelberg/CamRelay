@@ -1,0 +1,36 @@
+[Unit]
+Description=CamRelay - Lightweight RTSP Relay for Linux
+Documentation=https://github.com/yourusername/camrelay
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=camrelay
+Group=camrelay
+ExecStart=/usr/local/bin/camrelay -c /etc/camrelay.conf -d
+ExecReload=/bin/kill -HUP $MAINPID
+ExecStop=/bin/kill -TERM $MAINPID
+PIDFile=/var/run/camrelay.pid
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=camrelay
+
+# Security settings
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log /var/run
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=4096
+MemoryMax=1G
+CPUQuota=80%
+
+[Install]
+WantedBy=multi-user.target
