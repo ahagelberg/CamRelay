@@ -1419,7 +1419,24 @@ static void *stream_thread(void *arg) {
         logger_warn("*** NO RESPONSE TO KEYFRAME REQUESTS *** Camera may not support these methods");
     }
     
+    /* Initialize timeout tracking */
+    uint64_t last_data_time = get_timestamp_ms();
+    const uint64_t STREAM_TIMEOUT_MS = 30000; /* 30 seconds timeout */
+    
+    /* Initialize data quality tracking */
+    uint32_t consecutive_corrupted_packets = 0;
+    const uint32_t MAX_CORRUPTED_PACKETS = 10;
+    
     while (!stream->should_stop && stream->state == STREAM_STATE_STREAMING) {
+        /* Check for stream timeout */
+        uint64_t current_time = get_timestamp_ms();
+        if (current_time - last_data_time > STREAM_TIMEOUT_MS) {
+            logger_warn("Stream '%s' timeout - no data received for %lu ms", 
+                       stream->name, current_time - last_data_time);
+            logger_info("Stream '%s' disconnecting due to timeout", stream->name);
+            break;
+        }
+        
         if (stream->use_udp_transport) {
             /* UDP transport - read from RTP socket */
             struct sockaddr_in from_addr;
@@ -1428,6 +1445,7 @@ static void *stream_thread(void *arg) {
                                         (struct sockaddr*)&from_addr, &from_len);
             if (bytes_read > 0) {
                 /* Process UDP RTP packet */
+                last_data_time = get_timestamp_ms(); /* Update timeout */
                 process_rtp_packet(stream, buffer, bytes_read);
             } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
                 logger_error("UDP receive error for stream '%s': %s", stream->name, strerror(errno));
@@ -1435,12 +1453,29 @@ static void *stream_thread(void *arg) {
             }
         } else {
             /* TCP interleaved transport - read from RTSP socket */
-        ssize_t bytes_read = recv(socket_fd, buffer + incomplete_bytes, 
-                                 sizeof(buffer) - incomplete_bytes, MSG_DONTWAIT);
-        if (bytes_read > 0) {
-            /* Add new data to any incomplete data from previous reads */
-            ssize_t total_bytes = bytes_read + incomplete_bytes;
-            incomplete_bytes = 0; /* Reset for this processing cycle */
+            ssize_t bytes_read = recv(socket_fd, buffer + incomplete_bytes, 
+                                     sizeof(buffer) - incomplete_bytes, MSG_DONTWAIT);
+            if (bytes_read > 0) {
+                /* Update timeout when data is received */
+                last_data_time = get_timestamp_ms();
+                
+                /* Check for corrupted data - if we receive binary data when expecting RTSP */
+                if (bytes_read > 0 && buffer[0] < 32) {
+                    consecutive_corrupted_packets++;
+                    if (consecutive_corrupted_packets >= MAX_CORRUPTED_PACKETS) {
+                        logger_error("Stream '%s' receiving corrupted data (%d consecutive corrupted packets), disconnecting", 
+                                   stream->name, consecutive_corrupted_packets);
+                        break;
+                    }
+                    /* Skip this corrupted data */
+                    continue;
+                } else {
+                    consecutive_corrupted_packets = 0; /* Reset counter on good data */
+                }
+                
+                /* Add new data to any incomplete data from previous reads */
+                ssize_t total_bytes = bytes_read + incomplete_bytes;
+                incomplete_bytes = 0; /* Reset for this processing cycle */
             
             /* Check if this is interleaved data (starts with $) or raw RTP */
             if (buffer[0] == '$' && total_bytes >= 4) {
@@ -1854,16 +1889,16 @@ static void *stream_thread(void *arg) {
                     }
                 }
             }
-        } else if (bytes_read == 0) {
-            logger_warn("Stream '%s' connection closed by server", stream->name);
-            break;
-        } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            /* No data available, sleep briefly */
-            usleep(1000); /* 1ms */
-        } else {
-            logger_error("Stream '%s' read error: %s", stream->name, strerror(errno));
-            break;
-        }
+            } else if (bytes_read == 0) {
+                logger_warn("Stream '%s' connection closed by server", stream->name);
+                break;
+            } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                /* No data available, sleep briefly to prevent CPU spinning */
+                usleep(10000); /* 10ms */
+            } else {
+                logger_error("Stream '%s' read error: %s", stream->name, strerror(errno));
+                break;
+            }
         } /* End of TCP interleaved transport else block */
     }
     
@@ -1875,8 +1910,20 @@ static void *stream_thread(void *arg) {
         close_udp_sockets(stream);
     }
     
+    /* Update stream state and connection count */
+    pthread_mutex_lock(&stream->mutex);
     stream->state = STREAM_STATE_DISCONNECTED;
+    stream->active = false;
+    pthread_mutex_unlock(&stream->mutex);
     
+    /* Update manager connection count with proper locking */
+    pthread_mutex_lock(&stream->manager->mutex);
+    stream->manager->active_connections--;
+    logger_info("Stream '%s' connection count: %d/%d (decremented)", stream->name,
+               stream->manager->active_connections, stream->manager->max_connections);
+    pthread_mutex_unlock(&stream->manager->mutex);
+    
+    logger_info("Stream '%s' thread ended", stream->name);
     return NULL;
 }
 
@@ -2092,8 +2139,8 @@ int stream_manager_connect_stream(stream_manager_t *manager, const char *stream_
     }
     
     if (manager->active_connections >= manager->max_connections) {
-        logger_error("Maximum connections reached (%d), cannot connect stream '%s'", 
-                    manager->max_connections, stream_name);
+        logger_error("Maximum connections reached (%d/%d), cannot connect stream '%s'", 
+                    manager->active_connections, manager->max_connections, stream_name);
         pthread_mutex_unlock(&stream->mutex);
         return -1;
     }
@@ -2110,6 +2157,9 @@ int stream_manager_connect_stream(stream_manager_t *manager, const char *stream_
     
     stream->active = true;
     manager->active_connections++;
+    
+    logger_info("Stream '%s' connection count: %d/%d", stream_name, 
+               manager->active_connections, manager->max_connections);
     
     pthread_mutex_unlock(&stream->mutex);
     
@@ -2154,8 +2204,9 @@ int stream_manager_disconnect_stream(stream_manager_t *manager, const char *stre
     pthread_mutex_lock(&stream->mutex);
     stream->active = false;
     stream->state = STREAM_STATE_DISCONNECTED;
-    manager->active_connections--;
     pthread_mutex_unlock(&stream->mutex);
+    
+    /* Note: active_connections is decremented by the stream thread when it exits */
     
     logger_info("Disconnected stream '%s'", stream_name);
     return 0;
@@ -2171,10 +2222,51 @@ bool stream_manager_is_stream_connected(stream_manager_t *manager, const char *s
     if (!stream) return false;
     
     pthread_mutex_lock(&stream->mutex);
-    bool connected = (stream->state == STREAM_STATE_STREAMING);
+    bool connected = (stream->state == STREAM_STATE_STREAMING && stream->active);
     pthread_mutex_unlock(&stream->mutex);
     
     return connected;
+}
+
+/**
+ * @brief Check stream health and reconnect if needed
+ */
+int stream_manager_check_and_reconnect_stream(stream_manager_t *manager, const char *stream_name) {
+    if (!manager || !stream_name) return -1;
+    
+    stream_connection_t *stream = find_stream(manager, stream_name);
+    if (!stream) return -1;
+    
+    pthread_mutex_lock(&stream->mutex);
+    bool needs_reconnect = (!stream->active || stream->state != STREAM_STATE_STREAMING);
+    
+    /* Also check if stream has been inactive for too long (indicates corruption) */
+    if (!needs_reconnect && stream->active && stream->state == STREAM_STATE_STREAMING) {
+        uint64_t current_time = get_timestamp_ms();
+        uint64_t time_since_last_packet = current_time - stream->stats.last_packet_time;
+        
+        /* If no data received for more than 10 seconds, consider stream unhealthy */
+        if (time_since_last_packet > 10000) {
+            logger_warn("Stream '%s' appears unhealthy - no data for %lu ms, forcing reconnection", 
+                       stream_name, time_since_last_packet);
+            needs_reconnect = true;
+        }
+    }
+    pthread_mutex_unlock(&stream->mutex);
+    
+    if (needs_reconnect) {
+        logger_info("Stream '%s' needs reconnection, attempting to reconnect...", stream_name);
+        
+        /* Force disconnect first if stream is in a bad state */
+        if (stream->active) {
+            logger_info("Force disconnecting unhealthy stream '%s' before reconnection", stream_name);
+            stream_manager_disconnect_stream(manager, stream_name);
+        }
+        
+        return stream_manager_connect_stream(manager, stream_name);
+    }
+    
+    return 0; /* Stream is healthy */
 }
 
 /**

@@ -314,7 +314,8 @@ static int handle_play_request(client_connection_t *client, const char *request)
     /* Connect to stream manager to get video data */
     client_pool_t *pool = (client_pool_t *)client->callback_data;
     if (pool && pool->stream_manager) {
-        if (stream_manager_connect_stream(pool->stream_manager, client->stream_name) == 0) {
+        /* Check stream health and reconnect if needed */
+        if (stream_manager_check_and_reconnect_stream(pool->stream_manager, client->stream_name) == 0) {
             client->stream_connected = true;
             logger_info("*** STREAM CONNECTION *** Successfully connected client to stream '%s'", client->stream_name);
         } else {
@@ -413,6 +414,20 @@ static void *client_thread(void *arg) {
         
         buffer[bytes_read] = '\0';
         
+        /* Validate RTSP request format */
+        if (bytes_read < 4 || buffer[0] < 32 || buffer[0] > 126) {
+            logger_warn("Invalid RTSP request from %s: received %zd bytes starting with 0x%02x", 
+                       client->client_ip, bytes_read, (unsigned char)buffer[0]);
+            client->stats.error_count++;
+            
+            /* If we receive too many corrupted requests, disconnect the client */
+            if (client->stats.error_count > 10) {
+                logger_error("Too many corrupted requests from %s, disconnecting client", client->client_ip);
+                break;
+            }
+            continue;
+        }
+        
         /* Handle RTSP request */
         if (handle_rtsp_request(client, buffer) != 0) {
             logger_error("Failed to handle RTSP request from %s", client->client_ip);
@@ -426,7 +441,85 @@ static void *client_thread(void *arg) {
         client->udp_socket = -1;
     }
     
+    /* Disconnect from stream if connected */
+    if (client->stream_connected && strlen(client->stream_name) > 0) {
+        client_pool_t *pool = (client_pool_t *)client->callback_data;
+        if (pool && pool->stream_manager) {
+            /* Check if any other clients are watching this stream */
+            bool other_clients_watching = false;
+            pthread_mutex_lock(&pool->mutex);
+            for (uint16_t i = 0; i < pool->max_clients; i++) {
+                if (pool->clients[i].active && 
+                    pool->clients[i].stream_connected &&
+                    strcmp(pool->clients[i].stream_name, client->stream_name) == 0 &&
+                    &pool->clients[i] != client) {
+                    other_clients_watching = true;
+                    break;
+                }
+            }
+            pthread_mutex_unlock(&pool->mutex);
+            
+            /* Only disconnect stream if no other clients are watching */
+            if (!other_clients_watching) {
+                logger_info("No other clients watching stream '%s', disconnecting", client->stream_name);
+                stream_manager_disconnect_stream(pool->stream_manager, client->stream_name);
+            } else {
+                logger_info("Other clients still watching stream '%s', keeping connection", client->stream_name);
+            }
+        }
+    }
+    
     logger_info("Client thread ended for %s", client->client_ip);
+    return NULL;
+}
+
+/**
+ * @brief Stream health check thread
+ */
+static void *health_check_thread(void *arg) {
+    client_pool_t *pool = (client_pool_t *)arg;
+    
+    logger_info("Stream health check thread started");
+    
+    while (!pool->should_stop) {
+        /* Sleep for 10 seconds between health checks to allow proper cleanup */
+        sleep(10);
+        
+        if (pool->should_stop) break;
+        
+        /* Check health of all active streams */
+        pthread_mutex_lock(&pool->mutex);
+        for (uint16_t i = 0; i < pool->max_clients; i++) {
+            if (pool->clients[i].active && 
+                pool->clients[i].stream_connected &&
+                strlen(pool->clients[i].stream_name) > 0) {
+                
+                /* Check if stream is still healthy */
+                if (!stream_manager_is_stream_connected(pool->stream_manager, pool->clients[i].stream_name)) {
+                    logger_warn("Stream '%s' is no longer connected, attempting to reconnect...", 
+                               pool->clients[i].stream_name);
+                    
+                    /* Try to reconnect the stream */
+                    if (stream_manager_check_and_reconnect_stream(pool->stream_manager, pool->clients[i].stream_name) == 0) {
+                        logger_info("Successfully reconnected stream '%s'", pool->clients[i].stream_name);
+                    } else {
+                        logger_error("Failed to reconnect stream '%s'", pool->clients[i].stream_name);
+                        pool->clients[i].stream_connected = false;
+                    }
+                } else {
+                    /* Stream appears connected, but check if it's actually healthy */
+                    if (stream_manager_check_and_reconnect_stream(pool->stream_manager, pool->clients[i].stream_name) != 0) {
+                        logger_warn("Stream '%s' health check failed, marking as disconnected", 
+                                   pool->clients[i].stream_name);
+                        pool->clients[i].stream_connected = false;
+                    }
+                }
+            }
+        }
+        pthread_mutex_unlock(&pool->mutex);
+    }
+    
+    logger_info("Stream health check thread ended");
     return NULL;
 }
 
@@ -633,6 +726,16 @@ int client_pool_start(client_pool_t *pool) {
         return -1;
     }
     
+    /* Start health check thread */
+    if (pthread_create(&pool->health_check_thread, NULL, health_check_thread, pool) != 0) {
+        logger_error("Failed to create health check thread: %s", strerror(errno));
+        pool->should_stop = true;
+        pthread_join(pool->accept_thread, NULL);
+        close(pool->listen_socket);
+        pool->running = false;
+        return -1;
+    }
+    
     logger_info("Client pool started successfully on port %d", pool->listen_port);
     return 0;
 }
@@ -663,6 +766,9 @@ int client_pool_stop(client_pool_t *pool) {
     
     /* Wait for accept thread */
     pthread_join(pool->accept_thread, NULL);
+    
+    /* Wait for health check thread */
+    pthread_join(pool->health_check_thread, NULL);
     
     /* Stop all active clients */
     pthread_mutex_lock(&pool->mutex);
@@ -750,6 +856,17 @@ int client_pool_add_client(client_pool_t *pool, int socket_fd,
     timeout.tv_usec = 0;
     if (setsockopt(client->socket_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0) {
         logger_warn("Failed to set recv timeout for client %s: %s", client_ip, strerror(errno));
+    }
+    
+    /* Clear any pending data in the socket buffer */
+    char clear_buffer[1024];
+    int cleared_bytes = 0;
+    while (recv(client->socket_fd, clear_buffer, sizeof(clear_buffer), MSG_DONTWAIT) > 0) {
+        cleared_bytes += sizeof(clear_buffer);
+    }
+    if (cleared_bytes > 0) {
+        logger_info("Cleared %d bytes of stale data from client socket %s:%d", 
+                   cleared_bytes, client_ip, client_port);
     }
     
     /* Start client thread */

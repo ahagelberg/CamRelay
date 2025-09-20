@@ -108,6 +108,7 @@ typedef struct client_pool_s {
     uint16_t active_clients;        /**< Current active clients */
     
     pthread_t accept_thread;        /**< Accept thread */
+    pthread_t health_check_thread;  /**< Stream health check thread */
     pthread_mutex_t mutex;          /**< Pool synchronization */
     
     bool running;                   /**< Pool running state */

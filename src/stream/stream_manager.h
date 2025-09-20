@@ -193,6 +193,15 @@ int stream_manager_disconnect_stream(stream_manager_t *manager, const char *stre
 bool stream_manager_is_stream_connected(stream_manager_t *manager, const char *stream_name);
 
 /**
+ * @brief Check stream health and reconnect if needed
+ * 
+ * @param manager Stream manager
+ * @param stream_name Name of stream to check
+ * @return 0 on success, -1 on error
+ */
+int stream_manager_check_and_reconnect_stream(stream_manager_t *manager, const char *stream_name);
+
+/**
  * @brief Get stream statistics
  * 
  * @param manager Stream manager
