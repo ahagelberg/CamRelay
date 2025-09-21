@@ -7,10 +7,11 @@ A Linux-based RTSP camera relay system that connects to network cameras with aut
 - **Multi-Camera Support**: Connect to multiple RTSP cameras simultaneously
 - **RTSP Client Support**: Support RTSP clients (VLC, ffplay)
 - **On-Demand Streaming**: Only stream video when clients are connected
-- **Authentication**: Support RTSP authentication (username/password)
+- **Authentication**: Support RTSP authentication (Basic and Digest)
+- **RTP Fragmentation**: Handles large video packets with automatic fragmentation
 - **Configuration**: INI-style configuration with sensible defaults
 - **Logging**: Comprehensive logging for monitoring and debugging
-- **Future Extensible**: Designed for future web client protocol support
+- **Custom RTSP Implementation**: No external dependencies beyond OpenSSL
 
 ## Requirements
 
@@ -21,7 +22,6 @@ A Linux-based RTSP camera relay system that connects to network cameras with aut
   - build-essential
   - libssl-dev
   - pkg-config
-  - Live555 library
 
 ## Installation
 
@@ -32,25 +32,21 @@ sudo apt update
 sudo apt install build-essential libssl-dev pkg-config
 ```
 
-### 2. Build Live555
+### 2. Build CamRelay
 
 ```bash
-# Download and build Live555
-cd third_party
-wget http://www.live555.com/liveMedia/public/live555-latest.tar.gz
-tar -xzf live555-latest.tar.gz
-cd live
-./genMakefiles linux
+# Clone the repository
+git clone <repository-url>
+cd CamRelay
+
+# Build the project
 make
+
+# Clean build (if needed)
+make clean && make
 ```
 
-### 3. Build CamRelay
-
-```bash
-make
-```
-
-### 4. Install (Optional)
+### 3. Install (Optional)
 
 ```bash
 sudo make install
@@ -58,11 +54,14 @@ sudo make install
 
 ## Configuration
 
-Copy the example configuration file and modify it:
+Create a configuration file in INI format:
 
 ```bash
-cp config/camrelay.ini.example config/camrelay.ini
-# Edit config/camrelay.ini with your camera settings
+# Create configuration directory
+sudo mkdir -p /etc/camrelay
+
+# Create configuration file
+sudo nano /etc/camrelay/camrelay.ini
 ```
 
 ### Configuration File Format
@@ -87,7 +86,7 @@ connection_timeout_seconds=10
 
 [logging]
 level=info
-file_path=/var/log/camrelay2.log
+file_path=/var/log/camrelay.log
 max_file_size_mb=100
 max_files=5
 console_output=true
@@ -147,6 +146,18 @@ Logs are written to:
 
 Log levels: `trace`, `debug`, `info`, `warn`, `error`, `critical`
 
+### Architecture
+
+CamRelay uses a custom RTSP implementation with the following components:
+
+- **RTSPClient**: Connects to source cameras and receives RTP streams
+- **RTSPServer**: Serves RTSP streams to clients with session management
+- **RTSPCamera**: Manages individual camera connections and state
+- **ConfigManager**: Handles INI configuration file parsing
+- **Logger**: Provides structured logging with multiple levels
+
+The system handles RTP packet fragmentation automatically for large video frames and supports both Basic and Digest authentication methods.
+
 ## Development
 
 ### Project Structure
@@ -156,15 +167,23 @@ CamRelay/
 ├── src/
 │   ├── main.cpp
 │   ├── config/
+│   │   └── ConfigManager.cpp
 │   ├── camera/
-│   ├── stream/
-│   ├── client/
+│   │   ├── RTSPCamera.cpp
+│   │   └── RTSPClient.cpp
+│   ├── server/
+│   │   └── RTSPServer.cpp
 │   ├── logging/
+│   │   └── Logger.cpp
 │   └── utils/
+│       └── Utils.cpp
 ├── include/
 │   └── camrelay/
-├── third_party/
-│   └── live555/
+│       ├── config/
+│       ├── camera/
+│       ├── server/
+│       ├── logging/
+│       └── utils/
 ├── config/
 ├── tests/
 └── docs/
