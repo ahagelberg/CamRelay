@@ -1,51 +1,28 @@
 # Build artifacts
-build/
 *.o
 *.a
 *.so
-*.exe
-*.dll
+*.so.*
 *.dylib
+camrelay
+build/
+bin/
+lib/
 
-# IDE files
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-
-# OS files
-.DS_Store
-Thumbs.db
-*.tmp
-*.temp
+# Debug files
+*.dSYM/
+*.su
+*.idb
+*.pdb
 
 # Log files
 *.log
 logs/
 
-# Configuration files (keep examples)
-config/*.conf
-!config/*.example
-!config/*.json.example
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.backup
 
-# PID files
-*.pid
-
-# Test artifacts
-test_results/
-coverage/
-
-# Package files
-*.deb
-*.rpm
-*.tar.gz
-*.zip
-
-# Dependencies
-third_party/
-deps/
-
-# Generated files
-config.h
-version.h
+.nfs*

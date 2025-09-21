@@ -1,146 +1,187 @@
-# CamRelay
+# CamRelay - RTSP Camera Relay System
 
-Lightweight RTSP Relay for Linux
-
-A single-process, multi-threaded RTSP relay service that efficiently streams multiple camera feeds to multiple clients with on-demand source connection management.
+A Linux-based RTSP camera relay system that connects to network cameras with authentication and forwards streams to multiple clients. The system optimizes bandwidth by only streaming when clients are connected.
 
 ## Features
 
-- **Single Process Design**: Lightweight daemon with thread-per-client model
-- **On-Demand Streaming**: Only connects to cameras when clients are viewing
-- **Multiple Stream Support**: Handle multiple streams per camera
-- **Resource Management**: Configurable limits for memory, CPU, and connections
-- **Protocol Support**: RTSP 1.0/2.0 over TCP (primary) and UDP
-- **Codec Support**: H.264 (primary), H.265 (future)
-- **Web Browser Compatible**: Streams suitable for web browser viewing
-- **Authentication**: Support for camera authentication
-- **Error Handling**: Robust error handling with camera offline detection
+- **Multi-Camera Support**: Connect to multiple RTSP cameras simultaneously
+- **RTSP Client Support**: Support RTSP clients (VLC, ffplay)
+- **On-Demand Streaming**: Only stream video when clients are connected
+- **Authentication**: Support RTSP authentication (username/password)
+- **Configuration**: INI-style configuration with sensible defaults
+- **Logging**: Comprehensive logging for monitoring and debugging
+- **Future Extensible**: Designed for future web client protocol support
 
-## Quick Start
+## Requirements
 
-### Build
+- **Platform**: Ubuntu 22+ / Debian 11+ (ideally any Linux distribution)
+- **Dependencies**: 
+  - GCC 7+ (C++17 support)
+  - Make 4.0+
+  - build-essential
+  - libssl-dev
+  - pkg-config
+  - Live555 library
+
+## Installation
+
+### 1. Install Dependencies
 
 ```bash
-# Build release version
-./scripts/build.sh
-
-# Build debug version
-./scripts/build.sh -t debug
-
-# Clean build
-./scripts/build.sh -c
-
-# Build and install
-./scripts/build.sh -i
+sudo apt update
+sudo apt install build-essential libssl-dev pkg-config
 ```
 
-### Configuration
+### 2. Build Live555
 
-1. Copy the example configuration:
 ```bash
-sudo cp config/camrelay.conf.example /etc/camrelay.conf
+# Download and build Live555
+cd third_party
+wget http://www.live555.com/liveMedia/public/live555-latest.tar.gz
+tar -xzf live555-latest.tar.gz
+cd live
+./genMakefiles linux
+make
 ```
 
-2. Edit the configuration file:
+### 3. Build CamRelay
+
 ```bash
-sudo nano /etc/camrelay.conf
+make
 ```
 
-3. Start the service:
-```bash
-sudo systemctl start camrelay
-```
-
-### Manual Run
+### 4. Install (Optional)
 
 ```bash
-# Run with example config
-./build/bin/camrelay -c config/camrelay.conf.example
-
-# Run as daemon
-./build/bin/camrelay -c /etc/camrelay.conf -d
-
-# Debug mode
-./build/bin/camrelay -c config/camrelay.conf.example --log-level debug
+sudo make install
 ```
 
 ## Configuration
 
-CamRelay supports multiple configuration formats:
+Copy the example configuration file and modify it:
 
-- **INI format** (default): `camrelay.conf`
-- **JSON format**: `camrelay.json`
+```bash
+cp config/camrelay.ini.example config/camrelay.ini
+# Edit config/camrelay.ini with your camera settings
+```
 
-### Example Configuration
+### Configuration File Format
 
 ```ini
-# Global settings
-listen_port = 8554
-max_clients = 16
-max_memory_mb = 512
-log_level = info
+[server]
+rtsp_port=8554
+max_clients_per_stream=10
+connection_timeout_seconds=30
+buffer_size_kb=1024
 
-# Stream configurations
-[stream]
-camera_id = cam1
-name = cam1_main
-rtsp_url = rtsp://192.168.1.100:554/stream1
-username = admin
-password = mypassword
+[camera.1]
+id=camera_1
+name=Front Door Camera
+rtsp_url=rtsp://192.168.1.100:554/stream1
+username=admin
+password=password123
+enabled=true
+max_streams=5
+retry_interval_seconds=30
+connection_timeout_seconds=10
+
+[logging]
+level=info
+file_path=/var/log/camrelay2.log
+max_file_size_mb=100
+max_files=5
+console_output=true
+
+[performance]
+thread_pool_size=4
+keepalive_interval_seconds=30
+max_memory_usage_mb=512
 ```
 
-## Architecture
+## Usage
 
-- **Main Controller**: Coordinates all system components
-- **Stream Manager**: Manages camera connections and on-demand logic
-- **Client Pool**: One thread per client for handling connections
-- **Resource Manager**: Enforces configurable resource limits
-- **Error Handler**: Centralized error handling and recovery
-
-## Requirements
-
-- Linux (Debian/Ubuntu recommended)
-- GCC 4.9+ or Clang 3.5+
-- POSIX threads support
-- Network camera with RTSP support
-
-## Building from Source
-
-### Dependencies
+### Direct Execution
 
 ```bash
-# Ubuntu/Debian
-sudo apt-get update
-sudo apt-get install build-essential pkg-config
+# Run with default configuration
+./camrelay
 
-# Optional: live555 for RTSP support
-sudo apt-get install liblive555-dev
+# Run with custom configuration
+./camrelay --config /path/to/config.ini
+
+# Run in background
+nohup ./camrelay > /dev/null 2>&1 &
 ```
 
-### Build Steps
+### Systemd Service
 
 ```bash
-git clone <repository-url>
-cd CamRelay
-./scripts/build.sh
+# Enable and start service
+sudo systemctl enable camrelay
+sudo systemctl start camrelay
+
+# Check status
+sudo systemctl status camrelay
+
+# View logs
+sudo journalctl -u camrelay -f
 ```
 
-## Project Status
+## Client Access
 
-This is the initial version (v0.1.0) with basic structure and build system.
+Once running, clients can connect to the relay server:
 
-### Completed
-- [x] Project structure and build system
-- [x] Basic configuration parsing
-- [x] Logging system
-- [x] Error handling framework
-- [x] Systemd service integration
+```bash
+# Using VLC
+vlc rtsp://relay-server:8554/camera_1
 
-### In Progress
-- [ ] Core RTSP implementation
-- [ ] Stream management
-- [ ] Client handling
-- [ ] Resource management
+# Using ffplay
+ffplay rtsp://relay-server:8554/camera_1
+```
+
+## Logging
+
+Logs are written to:
+- Console (if `console_output=true`)
+- File: `/var/log/camrelay.log` (configurable)
+
+Log levels: `trace`, `debug`, `info`, `warn`, `error`, `critical`
+
+## Development
+
+### Project Structure
+
+```
+CamRelay/
+├── src/
+│   ├── main.cpp
+│   ├── config/
+│   ├── camera/
+│   ├── stream/
+│   ├── client/
+│   ├── logging/
+│   └── utils/
+├── include/
+│   └── camrelay/
+├── third_party/
+│   └── live555/
+├── config/
+├── tests/
+└── docs/
+```
+
+### Building
+
+```bash
+# Debug build
+make
+
+# Clean build
+make clean && make
+
+# Install
+sudo make install
+```
 
 ## License
 
