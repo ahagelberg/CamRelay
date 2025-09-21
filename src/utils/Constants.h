@@ -37,7 +37,9 @@ namespace ConfigDefaults {
     constexpr int SOCKET_TIMEOUT_SECONDS = 5;
     constexpr int MAX_PACKET_SIZE = 1048576; // 1MB for high-resolution video buffers
     constexpr int RECEIVE_BUFFER_SIZE = 1048576; // 1MB for socket receive buffers
-    constexpr int RTP_FRAGMENTATION_THRESHOLD = 65500; // Only fragment packets larger than this
+    constexpr int MAX_UDP_PAYLOAD_SIZE = 65000; // Conservative UDP payload limit to avoid fragmentation
+    constexpr int RTP_HEADER_SIZE = 12; // Standard RTP header size
+    constexpr int FU_A_HEADER_SIZE = 2; // FU-A fragmentation header size
     
     // Authentication constants
     constexpr std::string_view AUTH_BASIC = "Basic";

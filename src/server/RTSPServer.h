@@ -118,6 +118,9 @@ public:
     // RTP packet forwarding
     void forwardRTPPacket(const std::string& cameraId, const camera::RTPPacket& packet);
 
+    // Session cleanup (needed by RTSPClientSession)
+    void cleanupClientSessions(RTSPClientSession* clientSession);
+
     // Methods needed by RTSPClientSession
     std::string generateSessionId();
     bool parseRequest(const std::string& requestData, RTSPRequest& request);
@@ -128,14 +131,22 @@ public:
     void removeActiveSession(const std::string& sessionId);
     
     // RTP fragmentation
-    void sendRTPPacket(int socket, const struct sockaddr_in& clientAddr, 
+    bool sendRTPPacket(int socket, const struct sockaddr_in& clientAddr, 
                       const camera::RTPPacket& packet, std::atomic<uint16_t>& sequenceNumber);
 
 private:
+    // RTP packet building helpers
+    std::vector<uint8_t> buildRTPHeader(const camera::RTPPacket& packet, uint16_t sequenceNumber, bool isLastFragment = true);
+    void buildFU_AHeader(std::vector<uint8_t>& rtpPacket, uint8_t nalType, uint8_t nalNri, bool isFirstFragment, bool isLastFragment);
+    bool sendSingleRTPPacket(int socket, const struct sockaddr_in& clientAddr, 
+                           const camera::RTPPacket& packet, std::atomic<uint16_t>& sequenceNumber);
+    bool sendFragmentedRTPPacket(int socket, const struct sockaddr_in& clientAddr, 
+                               const camera::RTPPacket& packet, std::atomic<uint16_t>& sequenceNumber);
+    bool sendPacketData(int socket, const struct sockaddr_in& clientAddr, 
+                       const std::vector<uint8_t>& packetData, std::atomic<uint16_t>& sequenceNumber);
     // Network operations
     bool createServerSocket();
     void acceptConnections();
-    void cleanupInactiveSessions();
     void closeSocket(int socket);
     
     
@@ -165,7 +176,7 @@ private:
     
     // Threading
     std::thread acceptThread_;
-    std::thread cleanupThread_;
+    // cleanupThread_ removed - sessions are cleaned up immediately on disconnect
     
     // Camera management
     std::vector<std::shared_ptr<camera::RTSPCamera>> cameras_;

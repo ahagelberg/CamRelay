@@ -32,6 +32,8 @@ RTSPClient::RTSPClient()
     , cseq_(1)
     , user_agent_("CamRelay/1.0")
     , rtp_running_(false)
+    , keepalive_running_(false)
+    , session_timeout_seconds_(60)
     , connection_timeout_(10)
     , retry_count_(3)
     , last_status_code_(0) {
@@ -300,6 +302,44 @@ bool RTSPClient::sendTeardown() {
     return result;
 }
 
+bool RTSPClient::sendSetParameter() {
+    if (!connected_) {
+        last_error_ = "Not connected";
+        return false;
+    }
+    
+    std::map<std::string, std::string> headers;
+    headers["CSeq"] = generateCSeq();
+    headers["User-Agent"] = generateUserAgent();
+    headers["Session"] = session_id_;
+    
+    if (!username_.empty()) {
+        headers["Authorization"] = generateBasicAuth(username_, password_);
+    }
+    
+    // SET_PARAMETER with empty body is used for keepalive
+    return sendRequest("SET_PARAMETER", server_url_, headers, "", 0);
+}
+
+bool RTSPClient::sendGetParameter() {
+    if (!connected_) {
+        last_error_ = "Not connected";
+        return false;
+    }
+    
+    std::map<std::string, std::string> headers;
+    headers["CSeq"] = generateCSeq();
+    headers["User-Agent"] = generateUserAgent();
+    headers["Session"] = session_id_;
+    
+    if (!username_.empty()) {
+        headers["Authorization"] = generateBasicAuth(username_, password_);
+    }
+    
+    // GET_PARAMETER with empty body is used for keepalive
+    return sendRequest("GET_PARAMETER", server_url_, headers, "", 0);
+}
+
 void RTSPClient::setRTPCallback(RTPPacketCallback callback) {
     std::lock_guard<std::mutex> lock(mutex_);
     rtp_callback_ = callback;
@@ -561,11 +601,27 @@ bool RTSPClient::sendRequest(const std::string& method, const std::string& url,
         // Extract session ID if present
         auto session_header = response.headers.find("Session");
         if (session_header != response.headers.end()) {
-            session_id_ = session_header->second;
-            // Remove any timeout parameter
-            size_t timeout_pos = session_id_.find(';');
+            std::string session_value = session_header->second;
+            
+            // Parse session ID and timeout
+            size_t timeout_pos = session_value.find(';');
             if (timeout_pos != std::string::npos) {
-                session_id_ = session_id_.substr(0, timeout_pos);
+                session_id_ = session_value.substr(0, timeout_pos);
+                
+                // Parse timeout parameter (e.g., "timeout=60")
+                std::string timeout_part = session_value.substr(timeout_pos + 1);
+                size_t timeout_eq = timeout_part.find('=');
+                if (timeout_eq != std::string::npos) {
+                    std::string timeout_str = timeout_part.substr(timeout_eq + 1);
+                    try {
+                        session_timeout_seconds_ = std::stoi(timeout_str);
+                        LOG_DEBUG("RTSPClient parsed session timeout: " + std::to_string(session_timeout_seconds_) + " seconds");
+                    } catch (const std::exception& e) {
+                        LOG_WARN("RTSPClient failed to parse session timeout: " + timeout_str);
+                    }
+                }
+            } else {
+                session_id_ = session_value;
             }
         }
         
@@ -618,12 +674,14 @@ bool RTSPClient::receiveResponse(RTSPResponse& response) {
                 last_error_ = "Receive timeout";
             } else {
                 last_error_ = "Failed to receive response: " + std::string(strerror(errno));
+                connected_ = false; // Update connection state on socket error
             }
             return false;
         }
         
         if (received == 0) {
             last_error_ = "Connection closed by server";
+            connected_ = false; // Update connection state
             return false;
         }
         
@@ -924,6 +982,15 @@ void RTSPClient::rtpReceiverThread() {
             }
             
             if (parseRTPPacket(buffer, received, packet)) {
+                // Debug: Log RTP packet reception
+                static std::atomic<int> rtpPacketCount{0};
+                int currentPacket = rtpPacketCount++;
+                if (currentPacket >= 590 && currentPacket <= 600) {
+                    LOG_DEBUG("RTSPClient received RTP packet " + std::to_string(currentPacket) + 
+                             " (seq: " + std::to_string(packet.sequence_number) + 
+                             ", payload: " + std::to_string(packet.payload.size()) + " bytes)");
+                }
+                
                 if (rtp_callback_) {
                     rtp_callback_(packet);
                 } else {
@@ -935,10 +1002,17 @@ void RTSPClient::rtpReceiverThread() {
         } else if (received < 0) {
             // Check if it's a timeout error (EAGAIN/EWOULDBLOCK)
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // Debug: Log timeout events
+                static std::atomic<int> timeoutCount{0};
+                int currentTimeout = timeoutCount++;
+                if (currentTimeout % 100 == 0) { // Log every 100th timeout to avoid spam
+                    LOG_DEBUG("RTSPClient timeout #" + std::to_string(currentTimeout) + " (EAGAIN/EWOULDBLOCK)");
+                }
                 // Timeout occurred, continue loop to check rtp_running_
                 continue;
             } else {
                 // Other error occurred, break the loop
+                LOG_DEBUG("RTSPClient receive error: " + std::string(strerror(errno)) + " (errno=" + std::to_string(errno) + ")");
                 break;
             }
         }
@@ -1251,6 +1325,53 @@ std::string RTSPClient::generateCSeq() {
 
 std::string RTSPClient::generateUserAgent() {
     return user_agent_;
+}
+
+void RTSPClient::startKeepalive() {
+    if (keepalive_running_) {
+        return;
+    }
+    
+    keepalive_running_ = true;
+    keepalive_thread_ = std::thread([this]() {
+        LOG_DEBUG("RTSPClient keepalive thread started (timeout: " + std::to_string(session_timeout_seconds_) + "s)");
+        
+        // Send keepalive every 30 seconds (half of typical 60s timeout)
+        int keepalive_interval = std::max(10, session_timeout_seconds_ / 2);
+        
+        while (keepalive_running_ && connected_) {
+            std::this_thread::sleep_for(std::chrono::seconds(keepalive_interval));
+            
+            if (keepalive_running_ && connected_) {
+                // Try SET_PARAMETER first (VLC's preferred method)
+                LOG_DEBUG("RTSPClient sending keepalive SET_PARAMETER request");
+                if (!sendSetParameter()) {
+                    LOG_WARN("RTSPClient keepalive SET_PARAMETER failed, trying GET_PARAMETER: " + last_error_);
+                    if (!sendGetParameter()) {
+                        LOG_WARN("RTSPClient keepalive GET_PARAMETER failed, trying OPTIONS: " + last_error_);
+                        if (!sendOptions()) {
+                            LOG_ERROR("RTSPClient all keepalive methods failed: " + last_error_);
+                            // If all keepalive methods fail, the connection might be lost
+                        }
+                    }
+                }
+            }
+        }
+        
+        LOG_DEBUG("RTSPClient keepalive thread ended");
+    });
+}
+
+void RTSPClient::stopKeepalive() {
+    if (!keepalive_running_) {
+        return;
+    }
+    
+    keepalive_running_ = false;
+    
+    if (keepalive_thread_.joinable()) {
+        keepalive_thread_.join();
+    }
 }
 
 } // namespace camera

@@ -112,6 +112,8 @@ public:
     bool sendPlay();
     bool sendPause();
     bool sendTeardown();
+    bool sendSetParameter();
+    bool sendGetParameter();
     
     // Session management
     const RTSPSession& getSession() const { return session_; }
@@ -122,6 +124,10 @@ public:
     void setRTPCallback(RTPPacketCallback callback);
     void startRTPReceiver();
     void stopRTPReceiver();
+    
+    // Keepalive
+    void startKeepalive();
+    void stopKeepalive();
     
     // Configuration
     void setConnectionTimeout(int timeout_seconds);
@@ -199,6 +205,11 @@ private:
     std::thread rtp_thread_;
     std::atomic<bool> rtp_running_;
     RTPPacketCallback rtp_callback_;
+    
+    // Keepalive
+    std::thread keepalive_thread_;
+    std::atomic<bool> keepalive_running_;
+    int session_timeout_seconds_;
     
     // Configuration
     int connection_timeout_;

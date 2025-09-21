@@ -50,6 +50,11 @@ RTSPCamera::~RTSPCamera() {
     should_stream_ = false;
     cv_.notify_all();
     
+    // Stop keepalive if running
+    if (rtsp_client_) {
+        rtsp_client_->stopKeepalive();
+    }
+    
     // Detach threads if they're still running
     if (connection_thread_.joinable()) {
         connection_thread_.detach();
@@ -122,6 +127,9 @@ void RTSPCamera::disconnect() {
             health_thread_.detach();
         }
     }
+    
+    // Cleanup stream (stop RTP receiver and keepalive)
+    cleanupStream();
     
     performDisconnection();
 }
@@ -397,12 +405,24 @@ bool RTSPCamera::setupStream() {
     rtsp_client_->startRTPReceiver();
     LOG_DEBUG("Camera " + id_ + " RTP receiver started - waiting for data...");
     
+    // Start keepalive to prevent source camera timeout
+    LOG_DEBUG("Camera " + id_ + " starting RTSP keepalive...");
+    rtsp_client_->startKeepalive();
+    LOG_DEBUG("Camera " + id_ + " RTSP keepalive started");
+    
     LOG_INFO("Camera " + id_ + " stream setup completed successfully");
     return true;
 }
 
 void RTSPCamera::cleanupStream() {
     if (rtsp_client_) {
+        // Stop keepalive first
+        rtsp_client_->stopKeepalive();
+        
+        // Stop RTP receiver
+        rtsp_client_->stopRTPReceiver();
+        
+        // Then pause the stream
         rtsp_client_->sendPause();
     }
 }
@@ -428,9 +448,29 @@ void RTSPCamera::handleRTPPacket(const RTPPacket& packet) {
                   ", payload: " + std::to_string(packet.payload.size()) + " bytes)");
     }
     
+    // Log every packet around 590-600 to track when camera stops receiving
+    if (stats_.packets_received >= 590 && stats_.packets_received <= 600) {
+        LOG_DEBUG("Camera " + id_ + " received packet " + std::to_string(stats_.packets_received) + 
+                  " (seq: " + std::to_string(packet.sequence_number) + 
+                  ", payload: " + std::to_string(packet.payload.size()) + " bytes)");
+    }
+    
+    // Special debugging around packet 500-600 to catch the issue
+    if (stats_.packets_received >= 500 && stats_.packets_received <= 600) {
+        LOG_DEBUG("Camera " + id_ + " packet " + std::to_string(stats_.packets_received) + 
+                  " (seq: " + std::to_string(packet.sequence_number) + 
+                  ", payload: " + std::to_string(packet.payload.size()) + " bytes)");
+    }
+    
     // Forward to callback
     if (rtp_callback_) {
+        // Special debugging around packet 500-600 to catch the issue
+        if (stats_.packets_received >= 500 && stats_.packets_received <= 600) {
+            LOG_DEBUG("Camera " + id_ + " calling RTP callback for packet " + std::to_string(stats_.packets_received));
+        }
         rtp_callback_(id_, packet);
+    } else {
+        LOG_WARN("Camera " + id_ + " has no RTP callback set!");
     }
 }
 
@@ -445,15 +485,23 @@ void RTSPCamera::healthCheckThread() {
         
         // Check connection health
         if (!checkConnectionHealth()) {
+            LOG_DEBUG("Camera " + id_ + " health check failed, setting to ERROR state");
             setError("Health check failed");
             setState(CameraState::ERROR);
-            break;
+            // Don't break - continue monitoring for potential recovery
+            // The main monitoring loop will handle reconnection
         }
     }
 }
 
 bool RTSPCamera::checkConnectionHealth() {
-    if (!rtsp_client_ || !rtsp_client_->isConnected()) {
+    if (!rtsp_client_) {
+        LOG_DEBUG("Camera " + id_ + " health check failed: RTSP client is null");
+        return false;
+    }
+    
+    if (!rtsp_client_->isConnected()) {
+        LOG_DEBUG("Camera " + id_ + " health check failed: RTSP client reports not connected");
         return false;
     }
     
@@ -471,9 +519,10 @@ bool RTSPCamera::checkConnectionHealth() {
     
     // Check if we've received data recently (for streaming cameras)
     if (isState(CameraState::STREAMING)) {
-        // If no activity for more than 60 seconds, consider unhealthy
-        if ((current_time - last_activity) > 60000) {
-            setError("No data received for 60 seconds");
+        // If no activity for more than 120 seconds, consider unhealthy
+        // This gives more time for temporary network issues or camera pauses
+        if ((current_time - last_activity) > 120000) {
+            setError("No data received for 120 seconds");
             return false;
         }
     }

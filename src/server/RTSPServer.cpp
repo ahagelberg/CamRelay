@@ -52,10 +52,8 @@ bool RTSPServer::start(const RTSPServerConfig& config) {
         acceptConnections();
     });
     
-    // Start cleanup thread
-    cleanupThread_ = std::thread([this]() {
-        cleanupInactiveSessions();
-    });
+    // Note: Session cleanup is now handled immediately on disconnect
+    // No need for periodic cleanup thread
     
     running_ = true;
     LOG_INFO("RTSP Server started on port " + std::to_string(config_.port));
@@ -95,15 +93,7 @@ void RTSPServer::stop() {
         }
     }
     
-    if (cleanupThread_.joinable()) {
-        auto future = std::async(std::launch::async, [this]() {
-            cleanupThread_.join();
-        });
-        if (future.wait_for(std::chrono::milliseconds(50)) == std::future_status::timeout) {
-            LOG_WARN("Cleanup thread did not join in time, detaching");
-            cleanupThread_.detach();
-        }
-    }
+    // Cleanup thread removed - sessions are cleaned up immediately on disconnect
     
     running_ = false;
     LOG_INFO("RTSP Server stopped");
@@ -265,27 +255,41 @@ void RTSPServer::acceptConnections() {
     LOG_INFO("Stopped accepting RTSP connections");
 }
 
-void RTSPServer::cleanupInactiveSessions() {
-    while (!shouldStop_) {
-        std::this_thread::sleep_for(std::chrono::seconds(10));
-        
-        std::lock_guard<std::mutex> lock(sessionsMutex_);
-        auto it = clientSessions_.begin();
-        while (it != clientSessions_.end()) {
-            if (!(*it)->isActive()) {
-                LOG_DEBUG("Removing inactive client session: " + (*it)->getSessionId());
-                it = clientSessions_.erase(it);
+void RTSPServer::cleanupClientSessions(RTSPClientSession* clientSession) {
+    LOG_DEBUG("Starting cleanup for client session: " + clientSession->getSessionId());
+    
+    std::lock_guard<std::mutex> lock(sessionsMutex_);
+    std::lock_guard<std::mutex> activeLock(activeSessionsMutex_);
+    
+    int cleanedCount = 0;
+    auto activeIt = activeSessions_.begin();
+    while (activeIt != activeSessions_.end()) {
+        // Find sessions that belong to this specific client session
+        if (activeIt->second->clientSession == clientSession) {
+            LOG_DEBUG("Cleaning up associated active session: " + activeIt->first + " (camera: " + activeIt->second->cameraId + ")");
+            
+            // Stop RTP streaming first
+            activeIt->second->isPlaying = false;
+            activeIt->second->isActive = false;
+            
+            // Close RTP socket to release the port
+            if (activeIt->second->rtpSocket != -1) {
+                LOG_DEBUG("Closing RTP socket for session " + activeIt->first);
+                close(activeIt->second->rtpSocket);
+                activeIt->second->rtpSocket = -1;
                 
-                // Update stats
-                {
-                    std::lock_guard<std::mutex> statsLock(statsMutex_);
-                    stats_.activeClients--;
-                }
-            } else {
-                ++it;
+                // Small delay to ensure OS releases the port
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
             }
+            
+            activeIt = activeSessions_.erase(activeIt);
+            cleanedCount++;
+        } else {
+            ++activeIt;
         }
     }
+    
+    LOG_DEBUG("Cleaned up " + std::to_string(cleanedCount) + " active sessions for client " + clientSession->getSessionId());
 }
 
 bool RTSPServer::parseRequest(const std::string& requestData, RTSPRequest& request) {
@@ -612,7 +616,7 @@ RTSPResponse RTSPServer::handlePlay(const RTSPRequest& request, const std::strin
         LOG_DEBUG("Looking for session: '" + request.session + "' (length: " + std::to_string(request.session.length()) + ")");
         LOG_DEBUG("Available sessions:");
         for (const auto& [id, sess] : activeSessions_) {
-            LOG_DEBUG("  Stored session: '" + id + "' (length: " + std::to_string(id.length()) + ")");
+            LOG_DEBUG("  Stored session: '" + id + "'");
         }
         
         auto it = activeSessions_.find(request.session);
@@ -646,6 +650,14 @@ RTSPResponse RTSPServer::handlePlay(const RTSPRequest& request, const std::strin
     
     if (!rtspClientSession) {
         LOG_ERROR("No RTSPClientSession found for client " + clientIp);
+        response.statusCode = 454;
+        response.reasonPhrase = "Session Not Found";
+        return response;
+    }
+    
+    // Validate that the session is still active and not being cleaned up
+    if (!rtspClientSession->isActive()) {
+        LOG_WARN("RTSPClientSession is inactive for client " + clientIp);
         response.statusCode = 454;
         response.reasonPhrase = "Session Not Found";
         return response;
@@ -703,6 +715,33 @@ RTSPResponse RTSPServer::handleTeardown(const RTSPRequest& request, const std::s
         return response;
     }
     
+    // Remove the session from activeSessions_ immediately
+    {
+        std::lock_guard<std::mutex> lock(activeSessionsMutex_);
+        auto it = activeSessions_.find(request.session);
+        if (it != activeSessions_.end()) {
+            LOG_DEBUG("TEARDOWN: Removing session " + request.session + " from active sessions");
+            
+            // Close RTP socket to release the port
+            if (it->second->rtpSocket != -1) {
+                close(it->second->rtpSocket);
+                it->second->rtpSocket = -1;
+                
+                // Small delay to ensure OS releases the port
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+            
+            // Mark session as inactive
+            it->second->isActive = false;
+            it->second->isPlaying = false;
+            
+            activeSessions_.erase(it);
+            LOG_DEBUG("TEARDOWN: Session " + request.session + " removed successfully");
+        } else {
+            LOG_DEBUG("TEARDOWN: Session " + request.session + " not found in active sessions");
+        }
+    }
+    
     response.statusCode = 200;
     response.reasonPhrase = "OK";
     response.headers["Session"] = request.session;
@@ -751,10 +790,36 @@ std::string RTSPServer::getLocalIP() const {
 }
 
 int RTSPServer::findAvailablePort(int startPort) const {
-    // Simple implementation - just return a port in the range
-    // In production, this should actually check if the port is available
+    // Try to find an available port by actually testing if it can be bound
+    // Limit search to 50 ports to avoid blocking
+    for (int port = startPort; port < startPort + 100; port += 2) {
+        int testSocket = socket(AF_INET, SOCK_DGRAM, 0);
+        if (testSocket == -1) {
+            continue;
+        }
+        
+        // Set socket to non-blocking for faster testing
+        int flags = fcntl(testSocket, F_GETFL, 0);
+        fcntl(testSocket, F_SETFL, flags | O_NONBLOCK);
+        
+        struct sockaddr_in testAddr;
+        testAddr.sin_family = AF_INET;
+        testAddr.sin_addr.s_addr = INADDR_ANY;
+        testAddr.sin_port = htons(port);
+        
+        if (bind(testSocket, (struct sockaddr*)&testAddr, sizeof(testAddr)) == 0) {
+            close(testSocket);
+            LOG_DEBUG("Found available port: " + std::to_string(port));
+            return port;
+        }
+        
+        close(testSocket);
+    }
+    
+    // Fallback to simple counter if no port found
     static int portCounter = startPort;
-    return portCounter += 2; // Return even port for RTP, next odd for RTCP
+    LOG_WARN("No available ports found in range, using fallback counter");
+    return portCounter += 2;
 }
 
 void RTSPServer::closeSocket(int socket) {
@@ -818,17 +883,28 @@ void RTSPClientSession::sessionThread() {
     while (!shouldStop_) {
         RTSPRequest request;
         if (!receiveRequest(request)) {
+            // Break on any error (including connection closure)
+            LOG_DEBUG("RTSP request reception failed, ending session thread");
             break;
         }
         
         RTSPResponse response = server_->handleRequest(request, clientIp_);
         if (!sendResponse(response)) {
+            LOG_DEBUG("RTSP response sending failed, ending session thread");
             break;
         }
     }
     
     LOG_DEBUG("RTSP client session ended: " + sessionId_);
+    
+    // Clean up associated active sessions immediately
+    if (server_) {
+        LOG_DEBUG("Calling cleanupClientSessions for " + sessionId_);
+        server_->cleanupClientSessions(this);
+    }
+    
     active_ = false;
+    LOG_DEBUG("Session " + sessionId_ + " marked as inactive");
 }
 
 bool RTSPClientSession::receiveRequest(RTSPRequest& request) {
@@ -847,11 +923,11 @@ bool RTSPClientSession::receiveRequest(RTSPRequest& request) {
         ssize_t received = recv(clientSocket_, buffer, sizeof(buffer) - 1, 0);
         if (received < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                LOG_DEBUG("Socket timeout waiting for request from " + clientIp_);
-                continue; // Timeout, check shouldStop_ and continue
+                // Socket timeout - this is normal, just continue waiting
+                continue;
             }
             LOG_DEBUG("Socket error receiving from " + clientIp_ + ": " + std::string(strerror(errno)));
-            return false; // Error
+            return false; // Real error
         }
         
         if (received == 0) {
@@ -859,19 +935,52 @@ bool RTSPClientSession::receiveRequest(RTSPRequest& request) {
             return false; // Connection closed
         }
         
+        // Null-terminate the received data
         buffer[received] = '\0';
+        
+        // Validate received data is printable/ASCII
+        bool isValidData = true;
+        for (int i = 0; i < received; i++) {
+            if (buffer[i] < 32 && buffer[i] != '\r' && buffer[i] != '\n' && buffer[i] != '\t') {
+                isValidData = false;
+                break;
+            }
+        }
+        
+        if (!isValidData) {
+            LOG_WARN("Received non-printable data from " + clientIp_ + " (" + std::to_string(received) + " bytes)");
+            // Log first few bytes in hex for debugging
+            std::string hexData;
+            for (int i = 0; i < std::min(static_cast<int>(received), 16); i++) {
+                char hex[4];
+                snprintf(hex, sizeof(hex), "%02X ", (unsigned char)buffer[i]);
+                hexData += hex;
+            }
+            LOG_WARN("Data (hex): " + hexData);
+            return false; // Reject corrupted data
+        }
+        
         requestData += buffer;
         
-        // Extract first line for logging
+        // Extract first line for logging (limit length to prevent log spam)
         std::string bufferStr(buffer, received);
         size_t newlinePos = bufferStr.find('\n');
         std::string firstLine = (newlinePos != std::string::npos) ? bufferStr.substr(0, newlinePos) : bufferStr;
+        if (firstLine.length() > 100) {
+            firstLine = firstLine.substr(0, 100) + "...";
+        }
         LOG_DEBUG("Received " + std::to_string(received) + " bytes from " + clientIp_ + ": " + firstLine);
         
         // Check if we have a complete request
         if (requestData.find("\r\n\r\n") != std::string::npos) {
             LOG_DEBUG("Complete RTSP request received from " + clientIp_);
             break;
+        }
+        
+        // Prevent infinite accumulation of data
+        if (requestData.length() > 8192) {
+            LOG_ERROR("Request data too large from " + clientIp_ + " (" + std::to_string(requestData.length()) + " bytes)");
+            return false;
         }
     }
     
@@ -904,12 +1013,14 @@ void RTSPClientSession::cleanup() {
     for (auto& stream : streams_) {
         stopRTPStreaming(stream.second);
         
-        // Remove from active sessions
-        if (server_) {
-            server_->removeActiveSession(stream.second->sessionId);
-        }
+        // Note: Active sessions are cleaned up by the server's cleanupInactiveSessions()
+        // method before this cleanup() is called, so we don't need to remove them here
+        LOG_DEBUG("Cleaning up stream: " + stream.second->sessionId);
     }
     streams_.clear();
+    
+    // Mark session as inactive
+    active_ = false;
 }
 
 void RTSPClientSession::closeSocket(int socket) {
@@ -956,134 +1067,222 @@ void RTSPClientSession::setClientSession(std::shared_ptr<ClientSession> session)
 }
 
 void RTSPClientSession::rtpStreamingThread(std::shared_ptr<ClientSession> session) {
-    LOG_DEBUG("RTP streaming thread for session " + session->sessionId);
+    LOG_DEBUG("RTP streaming thread started for session " + session->sessionId);
     
     // Keep the streaming thread alive while session is active
+    // The actual RTP packet forwarding is handled by forwardRTPPacket()
+    // which is called directly from the camera data callback
     while (session->isActive && session->isPlaying && !shouldStop_) {
-        // The actual RTP packet forwarding is handled by forwardRTPPacket()
-        // This thread just keeps the session alive
+        // Just keep the session alive - RTP packets are sent via forwardRTPPacket()
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
     
-    LOG_DEBUG("RTP streaming thread ended for session " + session->sessionId);
+    LOG_DEBUG("RTP streaming thread ended for session " + session->sessionId + 
+              " (isActive=" + std::to_string(session->isActive) + 
+              ", isPlaying=" + std::to_string(session->isPlaying) + 
+              ", shouldStop=" + std::to_string(shouldStop_) + ")");
 }
 
 void RTSPServer::removeActiveSession(const std::string& sessionId) {
     std::lock_guard<std::mutex> lock(activeSessionsMutex_);
-    activeSessions_.erase(sessionId);
-    LOG_DEBUG("Removed active session: " + sessionId);
+    auto it = activeSessions_.find(sessionId);
+    if (it != activeSessions_.end()) {
+        auto session = it->second;
+        
+
+        // Stop RTP streaming if it's still active
+        if (session->isPlaying) {
+            LOG_DEBUG("Stopping RTP streaming for session " + sessionId);
+            session->isPlaying = false;
+        }
+        
+        // Close RTP socket to release the port
+        if (session->rtpSocket != -1) {
+            LOG_DEBUG("Closing RTP socket for session " + sessionId);
+            close(session->rtpSocket);
+            session->rtpSocket = -1;
+            
+            // Small delay to ensure OS releases the port
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        
+        // Mark session as inactive
+        session->isActive = false;
+        
+        activeSessions_.erase(it);
+        LOG_DEBUG("Removed active session: " + sessionId);
+    } else {
+        LOG_DEBUG("Session " + sessionId + " not found in active sessions (already removed?)");
+    }
 }
 
-void RTSPServer::sendRTPPacket(int socket, const struct sockaddr_in& clientAddr, 
+bool RTSPServer::sendRTPPacket(int socket, const struct sockaddr_in& clientAddr, 
                                const camera::RTPPacket& packet, std::atomic<uint16_t>& sequenceNumber) {
-    // Use a much larger threshold for fragmentation - only fragment very large packets
-    // Most video packets should be sent as single packets
-    const size_t maxPayloadSize = ConfigDefaults::RTP_FRAGMENTATION_THRESHOLD;
+    // Calculate the maximum UDP payload size that can be sent without fragmentation
+    const size_t maxUDPPayload = ConfigDefaults::MAX_UDP_PAYLOAD_SIZE;
+    const size_t rtpHeaderSize = ConfigDefaults::RTP_HEADER_SIZE;
+    const size_t totalPacketSize = rtpHeaderSize + packet.payload.size();
     
-    if (packet.payload.size() <= maxPayloadSize) {
+    if (totalPacketSize <= maxUDPPayload) {
         // Send as single packet
-        std::vector<uint8_t> rtpPacket;
-        rtpPacket.reserve(12 + packet.payload.size());
-        
-        // RTP Header (12 bytes)
-        uint8_t byte1 = (packet.version << 6) | (packet.padding << 5) | (packet.extension << 4) | packet.csrc_count;
-        rtpPacket.push_back(byte1);
-        
-        uint8_t byte2 = (packet.marker << 7) | packet.payload_type;
-        rtpPacket.push_back(byte2);
-        
-        // Sequence number (big-endian)
-        uint16_t seq = sequenceNumber.load();
-        rtpPacket.push_back((seq >> 8) & 0xFF);
-        rtpPacket.push_back(seq & 0xFF);
-        
-        // Timestamp (big-endian)
-        rtpPacket.push_back((packet.timestamp >> 24) & 0xFF);
-        rtpPacket.push_back((packet.timestamp >> 16) & 0xFF);
-        rtpPacket.push_back((packet.timestamp >> 8) & 0xFF);
-        rtpPacket.push_back(packet.timestamp & 0xFF);
-        
-        // SSRC (big-endian)
-        rtpPacket.push_back((packet.ssrc >> 24) & 0xFF);
-        rtpPacket.push_back((packet.ssrc >> 16) & 0xFF);
-        rtpPacket.push_back((packet.ssrc >> 8) & 0xFF);
-        rtpPacket.push_back(packet.ssrc & 0xFF);
-        
-        // Add payload
-        rtpPacket.insert(rtpPacket.end(), packet.payload.begin(), packet.payload.end());
-        
-        // Send packet
-        ssize_t sent = sendto(socket, rtpPacket.data(), rtpPacket.size(), 0,
-                            (struct sockaddr*)&clientAddr, sizeof(clientAddr));
-        if (sent > 0) {
-            sequenceNumber.fetch_add(1);
-        } else {
-            LOG_WARN("Failed to send RTP packet: " + std::string(strerror(errno)));
-        }
+        return sendSingleRTPPacket(socket, clientAddr, packet, sequenceNumber);
     } else {
-        // Fragment using FU-A
-        const uint8_t* payload = packet.payload.data();
-        size_t remaining = packet.payload.size();
-        size_t offset = 0;
-        bool isFirstFragment = true;
+        // Fragment using FU-A (H.264 fragmentation)
+        return sendFragmentedRTPPacket(socket, clientAddr, packet, sequenceNumber);
+    }
+}
+
+// RTP packet building helper functions
+std::vector<uint8_t> RTSPServer::buildRTPHeader(const camera::RTPPacket& packet, uint16_t sequenceNumber, bool isLastFragment) {
+    std::vector<uint8_t> header;
+    header.reserve(ConfigDefaults::RTP_HEADER_SIZE);
+    
+    // RTP Header (12 bytes)
+    uint8_t byte1 = (packet.version << 6) | (packet.padding << 5) | (packet.extension << 4) | packet.csrc_count;
+    header.push_back(byte1);
+    
+    // Marker bit only on last fragment
+    uint8_t byte2 = (isLastFragment ? packet.marker : 0) << 7 | packet.payload_type;
+    header.push_back(byte2);
+    
+    // Sequence number (big-endian)
+    header.push_back((sequenceNumber >> 8) & 0xFF);
+    header.push_back(sequenceNumber & 0xFF);
+    
+    // Timestamp (big-endian)
+    header.push_back((packet.timestamp >> 24) & 0xFF);
+    header.push_back((packet.timestamp >> 16) & 0xFF);
+    header.push_back((packet.timestamp >> 8) & 0xFF);
+    header.push_back(packet.timestamp & 0xFF);
+    
+    // SSRC (big-endian)
+    header.push_back((packet.ssrc >> 24) & 0xFF);
+    header.push_back((packet.ssrc >> 16) & 0xFF);
+    header.push_back((packet.ssrc >> 8) & 0xFF);
+    header.push_back(packet.ssrc & 0xFF);
+    
+    return header;
+}
+
+void RTSPServer::buildFU_AHeader(std::vector<uint8_t>& rtpPacket, uint8_t nalType, uint8_t nalNri, bool isFirstFragment, bool isLastFragment) {
+    // FU-A header (2 bytes)
+    // First byte: FU indicator (F=0, NRI=from original NAL, Type=28 for FU-A)
+    uint8_t fuIndicator = nalNri | 28; // NRI from original, Type=28
+    rtpPacket.push_back(fuIndicator);
+    
+    // Second byte: FU header (S=start, E=end, R=reserved, Type=original NAL type)
+    uint8_t fuHeader = (isFirstFragment ? 0x80 : 0x00) |  // S bit
+                      (isLastFragment ? 0x40 : 0x00) |   // E bit
+                      nalType;  // Original NAL type
+    rtpPacket.push_back(fuHeader);
+}
+
+bool RTSPServer::sendSingleRTPPacket(int socket, const struct sockaddr_in& clientAddr, 
+                                    const camera::RTPPacket& packet, std::atomic<uint16_t>& sequenceNumber) {
+    uint16_t seq = sequenceNumber.load();
+    std::vector<uint8_t> rtpPacket = buildRTPHeader(packet, seq, true);
+    
+    // Add payload
+    rtpPacket.insert(rtpPacket.end(), packet.payload.begin(), packet.payload.end());
+    
+    // Send packet
+    return sendPacketData(socket, clientAddr, rtpPacket, sequenceNumber);
+}
+
+bool RTSPServer::sendFragmentedRTPPacket(int socket, const struct sockaddr_in& clientAddr, 
+                                        const camera::RTPPacket& packet, std::atomic<uint16_t>& sequenceNumber) {
+    const size_t maxUDPPayload = ConfigDefaults::MAX_UDP_PAYLOAD_SIZE;
+    const size_t rtpHeaderSize = ConfigDefaults::RTP_HEADER_SIZE;
+    const size_t maxRTPPayload = maxUDPPayload - rtpHeaderSize;
+    const size_t maxFragmentPayload = maxRTPPayload - ConfigDefaults::FU_A_HEADER_SIZE;
+    
+    // Check if the packet is too large even for fragmentation
+    if (packet.payload.size() > maxFragmentPayload * 1000) { // Reasonable limit
+        LOG_ERROR("RTP packet too large for fragmentation: " + std::to_string(packet.payload.size()) + 
+                 " bytes (max fragment: " + std::to_string(maxFragmentPayload) + ")");
+        return false;
+    }
+    
+    // Validate payload has at least one byte (NAL header)
+    if (packet.payload.empty()) {
+        LOG_ERROR("Cannot fragment empty RTP payload");
+        return false;
+    }
+    
+    // Extract NAL header from the first byte of payload
+    const uint8_t* payload = packet.payload.data();
+    uint8_t nalHeader = payload[0];
+    uint8_t nalType = nalHeader & 0x1F;
+    uint8_t nalNri = nalHeader & 0x60;
+    
+    // Move payload pointer past the NAL header
+    payload++;
+    size_t remaining = packet.payload.size() - 1;
+    
+    // Validate we still have data to fragment
+    if (remaining == 0) {
+        LOG_ERROR("Cannot fragment RTP payload with only NAL header");
+        return false;
+    }
+    
+    LOG_DEBUG("Fragmenting RTP packet: payload size=" + std::to_string(packet.payload.size()) + 
+             ", max fragment payload=" + std::to_string(maxFragmentPayload));
+    
+    int fragmentCount = 0;
+    bool isFirstFragment = true;
+    
+    while (remaining > 0) {
+        // Calculate fragment size - all fragments contain only data (no NAL header)
+        size_t fragmentSize = std::min(remaining, maxFragmentPayload);
+        bool isLastFragment = (remaining == fragmentSize);
         
-        while (remaining > 0) {
-            size_t fragmentSize = std::min(remaining, maxPayloadSize - 2); // FU-A header size
-            
-            std::vector<uint8_t> rtpPacket;
-            rtpPacket.reserve(12 + 2 + fragmentSize);
-            
-            // RTP Header (12 bytes)
-            uint8_t byte1 = (packet.version << 6) | (packet.padding << 5) | (packet.extension << 4) | packet.csrc_count;
-            rtpPacket.push_back(byte1);
-            
-            // Marker bit only on last fragment
-            uint8_t byte2 = ((remaining == fragmentSize ? 1 : 0) << 7) | packet.payload_type;
-            rtpPacket.push_back(byte2);
-            
-            // Sequence number (big-endian)
-            uint16_t seq = sequenceNumber.load();
-            rtpPacket.push_back((seq >> 8) & 0xFF);
-            rtpPacket.push_back(seq & 0xFF);
-            
-            // Timestamp (big-endian)
-            rtpPacket.push_back((packet.timestamp >> 24) & 0xFF);
-            rtpPacket.push_back((packet.timestamp >> 16) & 0xFF);
-            rtpPacket.push_back((packet.timestamp >> 8) & 0xFF);
-            rtpPacket.push_back(packet.timestamp & 0xFF);
-            
-            // SSRC (big-endian)
-            rtpPacket.push_back((packet.ssrc >> 24) & 0xFF);
-            rtpPacket.push_back((packet.ssrc >> 16) & 0xFF);
-            rtpPacket.push_back((packet.ssrc >> 8) & 0xFF);
-            rtpPacket.push_back(packet.ssrc & 0xFF);
-            
-            // FU-A header
-            uint8_t fuHeader = (isFirstFragment ? 0x80 : 0x00) | 
-                              (remaining == fragmentSize ? 0x40 : 0x00) | 
-                              (payload[0] & 0x1F);
-            rtpPacket.push_back(fuHeader);
-            rtpPacket.push_back(payload[0] & 0xE0); // NAL type
-            
-            // Add fragment payload
-            rtpPacket.insert(rtpPacket.end(), payload + 1, payload + 1 + fragmentSize - 1);
-            
-            // Send fragment
-            ssize_t sent = sendto(socket, rtpPacket.data(), rtpPacket.size(), 0,
-                                (struct sockaddr*)&clientAddr, sizeof(clientAddr));
-            if (sent > 0) {
-                sequenceNumber.fetch_add(1);
-            } else {
-                LOG_WARN("Failed to send RTP fragment: " + std::string(strerror(errno)));
-                break;
-            }
-            
-            // Update for next fragment
-            payload += fragmentSize;
-            remaining -= fragmentSize;
-            offset += fragmentSize;
-            isFirstFragment = false;
+        // Build RTP packet
+        uint16_t seq = sequenceNumber.load();
+        std::vector<uint8_t> rtpPacket = buildRTPHeader(packet, seq, isLastFragment);
+        
+        // Add FU-A header
+        buildFU_AHeader(rtpPacket, nalType, nalNri, isFirstFragment, isLastFragment);
+        
+        // Add fragment payload (only data, no NAL header)
+        rtpPacket.insert(rtpPacket.end(), payload, payload + fragmentSize);
+        
+        // Send fragment
+        if (!sendPacketData(socket, clientAddr, rtpPacket, sequenceNumber)) {
+            LOG_WARN("Failed to send RTP fragment " + std::to_string(fragmentCount + 1));
+            break;
         }
+        
+        fragmentCount++;
+        LOG_DEBUG("Sent fragment " + std::to_string(fragmentCount) + 
+                 " (size=" + std::to_string(rtpPacket.size()) + 
+                 ", remaining=" + std::to_string(remaining - fragmentSize) + 
+                 ", S=" + std::to_string(isFirstFragment ? 1 : 0) +
+                 ", E=" + std::to_string(isLastFragment ? 1 : 0) + ")");
+        
+        // Update for next fragment
+        payload += fragmentSize;
+        remaining -= fragmentSize;
+        isFirstFragment = false;
+    }
+    
+    if (fragmentCount > 0) {
+        LOG_DEBUG("Successfully fragmented RTP packet into " + std::to_string(fragmentCount) + " fragments");
+        return true;
+    }
+    
+    return false;
+}
+
+bool RTSPServer::sendPacketData(int socket, const struct sockaddr_in& clientAddr, 
+                               const std::vector<uint8_t>& packetData, std::atomic<uint16_t>& sequenceNumber) {
+    ssize_t sent = sendto(socket, packetData.data(), packetData.size(), 0,
+                        (struct sockaddr*)&clientAddr, sizeof(clientAddr));
+    if (sent > 0) {
+        sequenceNumber.fetch_add(1);
+        return true;
+    } else {
+        LOG_WARN("Failed to send RTP packet: " + std::string(strerror(errno)));
+        return false;
     }
 }
 
@@ -1093,6 +1292,12 @@ void RTSPServer::forwardRTPPacket(const std::string& cameraId, const camera::RTP
     static std::chrono::steady_clock::time_point lastLogTime = std::chrono::steady_clock::now();
     
     packetCount++;
+    
+    // Debug: Log every call to forwardRTPPacket (reduced frequency)
+    if (packetCount % 100 == 0) {
+        LOG_DEBUG("forwardRTPPacket: cameraId=" + cameraId + ", packetCount=" + std::to_string(packetCount) + 
+                 ", payload=" + std::to_string(packet.payload.size()) + " bytes");
+    }
     
     // Log digest every 5 seconds
     auto now = std::chrono::steady_clock::now();
@@ -1114,20 +1319,104 @@ void RTSPServer::forwardRTPPacket(const std::string& cameraId, const camera::RTP
     std::lock_guard<std::mutex> lock(activeSessionsMutex_);
     
     // Find all active sessions for this camera
+    int forwardedCount = 0;
+    
     for (auto& [sessionId, session] : activeSessions_) {
         if (session->cameraId == cameraId && session->isActive && session->isPlaying) {
             // Forward the RTP packet to this client
             if (session->rtpSocket != -1) {
                 // Use the new sendRTPPacket method with fragmentation support
-                sendRTPPacket(session->rtpSocket, session->clientRtpAddr, packet, session->sequenceNumber);
+                bool sent = sendRTPPacket(session->rtpSocket, session->clientRtpAddr, packet, session->sequenceNumber);
                 
-                // Update statistics
-                {
-                    std::lock_guard<std::mutex> statsLock(statsMutex_);
-                    stats_.bytesTransmitted += packet.payload.size();
-                    stats_.packetsTransmitted++;
+                if (sent) {
+                    forwardedCount++;
+                    
+                    // Update statistics
+                    {
+                        std::lock_guard<std::mutex> statsLock(statsMutex_);
+                        stats_.bytesTransmitted += packet.payload.size();
+                        stats_.packetsTransmitted++;
+                    }
+                } else {
+                    LOG_WARN("Failed to send RTP packet " + std::to_string(packetCount) + " to session " + sessionId + " (seq: " + std::to_string(packet.sequence_number) + ")");
+                }
+            } else {
+                LOG_WARN("Session " + sessionId + " has invalid RTP socket (-1)");
+            }
+        }
+    }
+    
+    // Debug: Log if no packets were forwarded
+    if (forwardedCount == 0) {
+        LOG_DEBUG("No active sessions found for camera " + cameraId + " (total sessions: " + std::to_string(activeSessions_.size()) + ")");
+    } else {
+        // Log RTP packet details every 100 packets for debugging
+        static std::atomic<int> debugPacketCount{0};
+        
+        // Track what happens after packet 600
+        static std::atomic<int> packetsAfter600{0};
+        static bool packet600Seen{false};
+        if (debugPacketCount == 600) {
+            packet600Seen = true;
+            packetsAfter600 = 0;
+            LOG_DEBUG("*** PACKET 600 DETECTED - monitoring next 20 packets ***");
+        }
+        if (packet600Seen && packetsAfter600 < 20) {
+            packetsAfter600++;
+            LOG_DEBUG("Packet " + std::to_string(debugPacketCount) + " after packet 600: " + 
+                     "forwarded to " + std::to_string(forwardedCount) + " sessions");
+        }
+        if (debugPacketCount++ % 100 == 0) {
+            // Analyze NAL type for debugging
+            std::string nalType = "Unknown";
+            if (!packet.payload.empty()) {
+                uint8_t nalHeader = packet.payload[0];
+                uint8_t nalTypeValue = nalHeader & 0x1F;
+                switch (nalTypeValue) {
+                    case 1: nalType = "P-frame"; break;
+                    case 5: nalType = "IDR"; break;
+                    case 7: nalType = "SPS"; break;
+                    case 8: nalType = "PPS"; break;
+                    case 28: nalType = "FU-A"; break;
+                    default: nalType = "Type-" + std::to_string(nalTypeValue); break;
                 }
             }
+            LOG_DEBUG("RTP packet forwarded: original_seq=" + std::to_string(packet.sequence_number) + 
+                     ", payload=" + std::to_string(packet.payload.size()) + " bytes, " +
+                     "NAL=" + nalType + ", to " + std::to_string(forwardedCount) + " sessions");
+        }
+        
+        // Special debugging around packet 600 - this is the critical packet!
+        if (debugPacketCount >= 590 && debugPacketCount <= 610) {
+            std::string nalType = "Unknown";
+            bool isLastFragment = false;
+            if (!packet.payload.empty()) {
+                uint8_t nalHeader = packet.payload[0];
+                uint8_t nalTypeValue = nalHeader & 0x1F;
+                switch (nalTypeValue) {
+                    case 1: nalType = "P-frame"; break;
+                    case 5: nalType = "IDR"; break;
+                    case 7: nalType = "SPS"; break;
+                    case 8: nalType = "PPS"; break;
+                    case 28: 
+                        nalType = "FU-A";
+                        // Check if this is the last fragment of a FU-A packet
+                        if (packet.payload.size() > 1) {
+                            uint8_t fuHeader = packet.payload[1];
+                            isLastFragment = (fuHeader & 0x40) != 0; // E bit
+                        }
+                        break;
+                    default: nalType = "Type-" + std::to_string(nalTypeValue); break;
+                }
+            }
+            
+            // Highlight packet 600 specifically
+            std::string highlight = (debugPacketCount == 600) ? " *** PACKET 600 *** " : "";
+            LOG_DEBUG("RTP packet " + std::to_string(debugPacketCount) + highlight + 
+                     " forwarded: original_seq=" + std::to_string(packet.sequence_number) + 
+                     ", payload=" + std::to_string(packet.payload.size()) + " bytes, " +
+                     "NAL=" + nalType + (isLastFragment ? " (LAST)" : "") + 
+                     ", to " + std::to_string(forwardedCount) + " sessions");
         }
     }
 }

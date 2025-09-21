@@ -5,6 +5,7 @@
 #include <thread>
 #include <chrono>
 #include <algorithm>
+#include <map>
 
 #include "config/ConfigManager.h"
 #include "logging/Logger.h"
@@ -40,7 +41,13 @@ void signalHandler(int signal) {
         case SIGTERM:
             LOG_INFO("Received shutdown signal, stopping gracefully...");
             g_running = false;
-            cleanupCameras();
+            
+            // Immediately stop cameras to prevent RTP callbacks
+            for (const auto& camera : g_cameras) {
+                if (camera) {
+                    camera->disconnect();
+                }
+            }
             break;
         case SIGHUP:
             LOG_INFO("Received reload signal, reloading configuration...");
@@ -211,7 +218,14 @@ void runApplication(const ConfigManager& config) {
     
     // Main application loop
     while (g_running) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        // Check g_running more frequently for responsive shutdown
+        for (int i = 0; i < 10 && g_running; i++) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        
+        if (!g_running) {
+            break;
+        }
         
         // Monitor camera health
         monitorCameras();
@@ -424,19 +438,20 @@ void initializeRTSPServer(const ConfigManager& config) {
     for (const auto& camera : g_cameras) {
         if (camera) {
             camera->setRTPCallback([camera_id = camera->getId()](const std::string& camera_id_param, const RTPPacket& packet) {
-                // Log packet reception every 30 packets
-                static uint64_t packet_count = 0;
-                packet_count++;
-                if (packet_count % 30 == 0) {
-                    LOG_DEBUG("Camera " + camera_id_param + " received RTP packet: seq=" + 
-                             std::to_string(packet.sequence_number) + 
-                             ", payload_size=" + std::to_string(packet.payload.size()) + 
-                             ", total_packets=" + std::to_string(packet_count));
+                // Check if we should still be running
+                if (!g_running) {
+                    return; // Don't process packets during shutdown
                 }
                 
                 // Forward RTP packet to RTSP server for streaming to clients
                 if (g_rtspServer) {
-                    g_rtspServer->forwardRTPPacket(camera_id_param, packet);
+                    try {
+                        g_rtspServer->forwardRTPPacket(camera_id_param, packet);
+                    } catch (const std::exception& e) {
+                        LOG_ERROR("Exception in forwardRTPPacket: " + std::string(e.what()));
+                    } catch (...) {
+                        LOG_ERROR("Unknown exception in forwardRTPPacket");
+                    }
                 } else {
                     LOG_WARN("RTSP server not available to forward packet from camera " + camera_id_param);
                 }
@@ -464,6 +479,13 @@ void cleanupCameras() {
         LOG_DEBUG("RTSP server stopped");
     }
     
+    // Disconnect all cameras first
+    for (const auto& camera : g_cameras) {
+        if (camera) {
+            camera->disconnect();
+        }
+    }
+    
     // Clear all cameras
     g_cameras.clear();
     
@@ -473,6 +495,7 @@ void cleanupCameras() {
 // Monitor camera health
 void monitorCameras() {
     static uint64_t last_monitor_time = 0;
+    static std::map<std::string, uint64_t> last_reconnect_attempt;
     uint64_t current_time = TimeUtils::getCurrentTimeMs();
     
     // Monitor every 30 seconds
@@ -486,15 +509,94 @@ void monitorCameras() {
         
         const auto& stats = camera->getStats();
         CameraState state = camera->getState();
+        std::string camera_id = camera->getId();
         
         // Log camera status
         if (state == CameraState::STREAMING) {
-            LOG_DEBUG("Camera " + camera->getId() + " stats: " +
+            LOG_DEBUG("Camera " + camera_id + " stats: " +
                      "packets=" + std::to_string(stats.packets_received) +
                      ", bytes=" + std::to_string(stats.bytes_received) +
                      ", healthy=" + (camera->isHealthy() ? "yes" : "no"));
         } else if (state == CameraState::ERROR) {
-            LOG_WARN("Camera " + camera->getId() + " in error state: " + camera->getLastError());
+            LOG_WARN("Camera " + camera_id + " in error state: " + camera->getLastError());
+            LOG_DEBUG("Camera " + camera_id + " last activity: " + std::to_string(stats.last_packet_time) + 
+                     ", current time: " + std::to_string(current_time) +
+                     ", time since last packet: " + std::to_string(current_time - stats.last_packet_time) + "ms");
+            
+            // Attempt reconnection for cameras in ERROR state
+            // Only try to reconnect every 60 seconds to avoid spam
+            uint64_t last_attempt = last_reconnect_attempt[camera_id];
+            LOG_DEBUG("Camera " + camera_id + " last reconnect attempt: " + std::to_string(last_attempt) + 
+                     ", time since last attempt: " + std::to_string(current_time - last_attempt) + "ms");
+            if (current_time - last_attempt > 60000) { // 60 seconds between attempts
+                LOG_INFO("Attempting to reconnect camera " + camera_id + "...");
+                last_reconnect_attempt[camera_id] = current_time;
+                
+                // Start reconnection in a separate thread
+                std::thread([camera_ptr = camera.get(), camera_id]() {
+                    if (camera_ptr->connect()) {
+                        LOG_DEBUG("Camera " + camera_id + " reconnection initiated");
+                        
+                        // Wait for connection to complete, then start streaming
+                        int attempts = 0;
+                        while (attempts < 100) { // 10 seconds timeout
+                            if (camera_ptr->isState(CameraState::CONNECTED)) {
+                                LOG_DEBUG("Camera " + camera_id + " reconnected, starting stream...");
+                                if (camera_ptr->startStream()) {
+                                    LOG_INFO("Camera " + camera_id + " reconnected and stream restarted successfully");
+                                } else {
+                                    LOG_ERROR("Camera " + camera_id + " reconnected but failed to start stream");
+                                }
+                                break;
+                            } else if (camera_ptr->isState(CameraState::ERROR)) {
+                                LOG_ERROR("Camera " + camera_id + " reconnection failed");
+                                break;
+                            }
+                            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                            attempts++;
+                        }
+                    } else {
+                        LOG_ERROR("Failed to initiate reconnection to camera: " + camera_id);
+                    }
+                }).detach();
+            }
+        } else if (state == CameraState::DISCONNECTED) {
+            LOG_DEBUG("Camera " + camera_id + " is disconnected");
+            
+            // Attempt reconnection for disconnected cameras
+            uint64_t last_attempt = last_reconnect_attempt[camera_id];
+            if (current_time - last_attempt > 60000) { // 60 seconds between attempts
+                LOG_INFO("Attempting to reconnect disconnected camera " + camera_id + "...");
+                last_reconnect_attempt[camera_id] = current_time;
+                
+                // Start reconnection in a separate thread
+                std::thread([camera_ptr = camera.get(), camera_id]() {
+                    if (camera_ptr->connect()) {
+                        LOG_DEBUG("Camera " + camera_id + " reconnection initiated");
+                        
+                        // Wait for connection to complete, then start streaming
+                        int attempts = 0;
+                        while (attempts < 100) { // 10 seconds timeout
+                            if (camera_ptr->isState(CameraState::CONNECTED)) {
+                                LOG_DEBUG("Camera " + camera_id + " reconnected, starting stream...");
+                                if (camera_ptr->startStream()) {
+                                    LOG_INFO("Camera " + camera_id + " reconnected and stream restarted successfully");
+                                } else {
+                                    LOG_ERROR("Camera " + camera_id + " reconnected but failed to start stream");
+                                }
+                                break;
+                            } else if (camera_ptr->isState(CameraState::ERROR)) {
+                                LOG_ERROR("Camera " + camera_id + " reconnection failed");
+                                break;
+                            }
+                            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                            attempts++;
+                        }
+                    } else {
+                        LOG_ERROR("Failed to initiate reconnection to camera: " + camera_id);
+                    }
+                }).detach();
+            }
         }
     }
 }
