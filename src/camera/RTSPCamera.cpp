@@ -448,20 +448,6 @@ void RTSPCamera::handleRTPPacket(const RTPPacket& packet) {
                   ", payload: " + std::to_string(packet.payload.size()) + " bytes)");
     }
     
-    // Log every packet around 590-600 to track when camera stops receiving
-    if (stats_.packets_received >= 590 && stats_.packets_received <= 600) {
-        LOG_DEBUG("Camera " + id_ + " received packet " + std::to_string(stats_.packets_received) + 
-                  " (seq: " + std::to_string(packet.sequence_number) + 
-                  ", payload: " + std::to_string(packet.payload.size()) + " bytes)");
-    }
-    
-    // Special debugging around packet 500-600 to catch the issue
-    if (stats_.packets_received >= 500 && stats_.packets_received <= 600) {
-        LOG_DEBUG("Camera " + id_ + " packet " + std::to_string(stats_.packets_received) + 
-                  " (seq: " + std::to_string(packet.sequence_number) + 
-                  ", payload: " + std::to_string(packet.payload.size()) + " bytes)");
-    }
-    
     // Forward to callback
     if (rtp_callback_) {
         // Special debugging around packet 500-600 to catch the issue
@@ -469,8 +455,6 @@ void RTSPCamera::handleRTPPacket(const RTPPacket& packet) {
             LOG_DEBUG("Camera " + id_ + " calling RTP callback for packet " + std::to_string(stats_.packets_received));
         }
         rtp_callback_(id_, packet);
-    } else {
-        LOG_WARN("Camera " + id_ + " has no RTP callback set!");
     }
 }
 
