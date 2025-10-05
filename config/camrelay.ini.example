@@ -6,29 +6,31 @@ max_clients_per_stream=10
 connection_timeout_seconds=30
 buffer_size_kb=1024
 
-# Future web client support (commented out for now)
-# web_port=8080
-# websocket_port=8081
+[logging]
+level=INFO
+file_path=logs/camrelay.log
+max_file_size_mb=100
+max_files=5
+console_output=true
 
 [camera.1]
-id=bunnyland2
-name=Bunnyland 2
-rtsp_url=rtsp://192.168.42.113:554/h264Preview_01_sub
-username=admin
-password=osminkad fluffis
+id=camera1
+name=Camera 1
+rtsp_url=rtsp://<ip-address1>:554/h264Preview_01_sub
+username=
+password=
 enabled=true
 max_streams=5
 retry_interval_seconds=30
 connection_timeout_seconds=10
 
-[logging]
-level=debug
-file_path=camrelay.log
-max_file_size_mb=100
-max_files=5
-console_output=true
-
-[performance]
-thread_pool_size=4
-keepalive_interval_seconds=30
-max_memory_usage_mb=512
+[camera.2]
+id=camera2
+name=Camera 2
+rtsp_url=rtsp://<ip-address2>:554/h264Preview_01_sub
+username=
+password=
+enabled=true
+max_streams=5
+retry_interval_seconds=30
+connection_timeout_seconds=10
